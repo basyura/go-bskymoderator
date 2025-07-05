@@ -1,11 +1,11 @@
 package main
 
 import (
+	"bskymoderator/config"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log"
-	"os"
 	"time"
 
 	"github.com/bluesky-social/indigo/api/atproto"
@@ -16,7 +16,7 @@ import (
 
 var _client *xrpc.Client
 
-type BskyArgs struct {
+type BskyParam struct {
 	UserId    string
 	UserDid   string
 	Password  string
@@ -27,41 +27,24 @@ type BskyArgs struct {
 
 func main() {
 
-	if len(os.Args) != 5 {
-		fmt.Println("$ goskymoderator id password uri query")
-		return
-	}
-
-	args := &BskyArgs{
-		UserId:   os.Args[1],
-		Password: os.Args[2],
-		ListId:   os.Args[3],
-		Query:    os.Args[4],
-	}
-
-	ctx := context.Background()
-	did, err := getDid(args, ctx)
+	conf, err := initializeConfig()
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
-	atUri := "at://" + did + "/app.bsky.graph.list/" + args.ListId
 
-	args.UserDid = did
-	args.ListAtUri = atUri
+	fmt.Println("Did :", conf.UserDid)
+	fmt.Println("AtUri :", conf.ListAtUri)
 
-	fmt.Println("Did :", did)
-	fmt.Println("AtUri :", atUri)
-
-	if err := doMain(args); err != nil {
+	if err := doMain(); err != nil {
 		fmt.Println(err)
 	}
 }
 
-func doMain(args *BskyArgs) error {
+func doMain() error {
 
 	ctx := context.Background()
-	registered := fetchExistingHandles(args, ctx)
+	registered := fetchExistingHandles(ctx)
 
 	time.Sleep(2 * time.Second)
 
@@ -69,7 +52,7 @@ func doMain(args *BskyArgs) error {
 	count := 0
 	total := 0
 	for {
-		resp, err := searchActors(args, ctx, cursor)
+		resp, err := searchActors(ctx, cursor)
 		if err != nil {
 			return fmt.Errorf("検索失敗: %v", err)
 		}
@@ -81,7 +64,7 @@ func doMain(args *BskyArgs) error {
 				continue
 			}
 
-			err = register(args, ctx, user)
+			err = register(ctx, user)
 			if err != nil {
 				log.Printf("❌  %d 登録失敗: %s (%v)", total, user.Handle, err)
 			} else {
@@ -101,14 +84,15 @@ func doMain(args *BskyArgs) error {
 	return nil
 }
 
-func fetchExistingHandles(args *BskyArgs, ctx context.Context) map[string]bool {
-	client := getClient(args, ctx)
+func fetchExistingHandles(ctx context.Context) map[string]bool {
+	conf := config.Instance()
+	client := getClient(ctx)
 	existing := make(map[string]bool)
 	cursor := ""
 	limit := int64(100)
 	total := 1
 	for {
-		resp, err := atproto.RepoListRecords(ctx, client, "app.bsky.graph.listitem", cursor, limit, args.UserDid, false)
+		resp, err := atproto.RepoListRecords(ctx, client, "app.bsky.graph.listitem", cursor, limit, conf.UserDid, false)
 		fmt.Print("\rfetch ExistingHandles ... ", total*100, "                     ")
 		total++
 		if err != nil {
@@ -128,7 +112,7 @@ func fetchExistingHandles(args *BskyArgs, ctx context.Context) map[string]bool {
 				continue
 			}
 
-			if item.List != args.ListAtUri {
+			if item.List != conf.ListAtUri {
 				continue
 			}
 			existing[item.Subject] = true
@@ -147,14 +131,16 @@ func fetchExistingHandles(args *BskyArgs, ctx context.Context) map[string]bool {
 	return existing
 }
 
-func getClient(args *BskyArgs, ctx context.Context) *xrpc.Client {
+func getClient(ctx context.Context) *xrpc.Client {
 
 	if isValidSession(ctx) {
 		return _client
 	}
 
-	handle := args.UserId
-	appPassword := args.Password
+	conf := config.Instance()
+
+	handle := conf.UserId
+	appPassword := conf.Password
 
 	xrpClient := &xrpc.Client{Host: "https://bsky.social"}
 	sess, err := atproto.ServerCreateSession(ctx, xrpClient, &atproto.ServerCreateSession_Input{
@@ -176,21 +162,23 @@ func getClient(args *BskyArgs, ctx context.Context) *xrpc.Client {
 	return _client
 }
 
-func searchActors(args *BskyArgs, ctx context.Context, cursor string) (*bsky.ActorSearchActors_Output, error) {
-	xrpClient := getClient(args, ctx)
-	resp, err := bsky.ActorSearchActors(ctx, xrpClient, cursor, 100, args.Query, "")
+func searchActors(ctx context.Context, cursor string) (*bsky.ActorSearchActors_Output, error) {
+	conf := config.Instance()
+	xrpClient := getClient(ctx)
+	resp, err := bsky.ActorSearchActors(ctx, xrpClient, cursor, 100, conf.Query, "")
 	return resp, err
 }
 
-func register(args *BskyArgs, ctx context.Context, user *bsky.ActorDefs_ProfileView) error {
-	client := getClient(args, ctx)
+func register(ctx context.Context, user *bsky.ActorDefs_ProfileView) error {
+	conf := config.Instance()
+	client := getClient(ctx)
 	_, err := atproto.RepoCreateRecord(ctx, client, &atproto.RepoCreateRecord_Input{
 		Repo:       client.Auth.Did,
 		Collection: "app.bsky.graph.listitem",
 		Record: &lexutil.LexiconTypeDecoder{
 			Val: &bsky.GraphListitem{
 				Subject:   user.Did,
-				List:      args.ListAtUri,
+				List:      conf.ListAtUri,
 				CreatedAt: time.Now().Format(time.RFC3339),
 			},
 		},
@@ -213,12 +201,31 @@ func isValidSession(ctx context.Context) bool {
 	// return err == nil
 }
 
-func getDid(args *BskyArgs, ctx context.Context) (string, error) {
-	client := getClient(args, ctx)
+func getDid(ctx context.Context) (string, error) {
+	client := getClient(ctx)
 	session, err := atproto.ServerGetSession(ctx, client)
 	if err != nil {
 		return "", err
 	}
 
 	return session.Did, nil
+}
+
+func initializeConfig() (*config.Config, error) {
+	conf, err := config.InitializeConfig()
+	if err != nil {
+		return nil, err
+	}
+
+	ctx := context.Background()
+	did, err := getDid(ctx)
+	if err != nil {
+		return nil, err
+	}
+	atUri := "at://" + did + "/app.bsky.graph.list/" + conf.ListId
+
+	conf.UserDid = did
+	conf.ListAtUri = atUri
+
+	return conf, err
 }
