@@ -16,15 +16,6 @@ import (
 
 var _client *xrpc.Client
 
-type BskyParam struct {
-	UserId    string
-	UserDid   string
-	Password  string
-	ListId    string
-	ListAtUri string
-	Query     string
-}
-
 func main() {
 
 	conf, err := initializeConfig()
