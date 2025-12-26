@@ -1,12 +1,15 @@
 package main
 
 import (
-	"bskymoderator/config"
-	"context"
-	"encoding/json"
-	"fmt"
-	"log"
-	"time"
+    "bskymoderator/config"
+    "context"
+    "encoding/json"
+    "fmt"
+    "log"
+    "os"
+    "sort"
+    "strings"
+    "time"
 
 	"github.com/bluesky-social/indigo/api/atproto"
 	"github.com/bluesky-social/indigo/api/bsky"
@@ -15,6 +18,7 @@ import (
 )
 
 var _client *xrpc.Client
+var ignoreCache map[string]bool
 
 func main() {
 
@@ -76,50 +80,60 @@ func doMain() error {
 }
 
 func fetchExistingHandles(ctx context.Context) map[string]bool {
-	conf := config.Instance()
-	client := getClient(ctx)
-	existing := make(map[string]bool)
-	cursor := ""
-	limit := int64(100)
-	total := 1
-	for {
-		resp, err := atproto.RepoListRecords(ctx, client, "app.bsky.graph.listitem", cursor, limit, conf.UserDid, false)
-		fmt.Print("\rfetch ExistingHandles ... ", total*100, "                     ")
-		total++
-		if err != nil {
-			log.Fatalf("リスト項目取得失敗: %v", err)
-		}
+    // 1) ignore.txt があればそれを優先
+    if m, ok := readIgnore(); ok {
+        ignoreCache = m
+        fmt.Printf("✅ 既存登録(ファイル): %d 件\n", len(m))
+        return m
+    }
 
-		for _, rec := range resp.Records {
-			item := new(bsky.GraphListitem)
+    // 2) なければ API で取得し、ファイルへ保存
+    conf := config.Instance()
+    client := getClient(ctx)
+    existing := make(map[string]bool)
+    cursor := ""
+    limit := int64(100)
+    total := 1
+    for {
+        resp, err := atproto.RepoListRecords(ctx, client, "app.bsky.graph.listitem", cursor, limit, conf.UserDid, false)
+        fmt.Print("\rfetch ExistingHandles ... ", total*100, "                     ")
+        total++
+        if err != nil {
+            log.Fatalf("リスト項目取得失敗: %v", err)
+        }
 
-			raw, err := rec.Value.MarshalJSON()
-			if err != nil {
-				log.Printf("⚠️ MarshalJSON 失敗: %v", err)
-				continue
-			}
-			if err := json.Unmarshal(raw, item); err != nil {
-				log.Printf("⚠️ json.Unmarshal 失敗: %v", err)
-				continue
-			}
+        for _, rec := range resp.Records {
+            item := new(bsky.GraphListitem)
 
-			if item.List != conf.ListAtUri {
-				continue
-			}
-			existing[item.Subject] = true
-		}
+            raw, err := rec.Value.MarshalJSON()
+            if err != nil {
+                log.Printf("⚠️ MarshalJSON 失敗: %v", err)
+                continue
+            }
+            if err := json.Unmarshal(raw, item); err != nil {
+                log.Printf("⚠️ json.Unmarshal 失敗: %v", err)
+                continue
+            }
 
-		if resp.Cursor == nil || *resp.Cursor == "" {
-			break
-		}
-		cursor = *resp.Cursor
-	}
+            if item.List != conf.ListAtUri {
+                continue
+            }
+            existing[item.Subject] = true
+        }
 
-	fmt.Println("")
+        if resp.Cursor == nil || *resp.Cursor == "" {
+            break
+        }
+        cursor = *resp.Cursor
+    }
 
-	fmt.Printf("✅ 既存登録: %d 件取得\n", len(existing))
+    // 書き出しとキャッシュ更新
+    writeIgnoreAll(existing)
+    ignoreCache = existing
 
-	return existing
+    fmt.Println("")
+    fmt.Printf("✅ 既存登録(API): %d 件\n", len(existing))
+    return existing
 }
 
 func getClient(ctx context.Context) *xrpc.Client {
@@ -161,21 +175,24 @@ func searchActors(ctx context.Context, cursor string) (*bsky.ActorSearchActors_O
 }
 
 func register(ctx context.Context, user *bsky.ActorDefs_ProfileView) error {
-	conf := config.Instance()
-	client := getClient(ctx)
-	_, err := atproto.RepoCreateRecord(ctx, client, &atproto.RepoCreateRecord_Input{
-		Repo:       client.Auth.Did,
-		Collection: "app.bsky.graph.listitem",
-		Record: &lexutil.LexiconTypeDecoder{
-			Val: &bsky.GraphListitem{
-				Subject:   user.Did,
-				List:      conf.ListAtUri,
-				CreatedAt: time.Now().Format(time.RFC3339),
-			},
-		},
-	})
+    conf := config.Instance()
+    client := getClient(ctx)
+    _, err := atproto.RepoCreateRecord(ctx, client, &atproto.RepoCreateRecord_Input{
+        Repo:       client.Auth.Did,
+        Collection: "app.bsky.graph.listitem",
+        Record: &lexutil.LexiconTypeDecoder{
+            Val: &bsky.GraphListitem{
+                Subject:   user.Did,
+                List:      conf.ListAtUri,
+                CreatedAt: time.Now().Format(time.RFC3339),
+            },
+        },
+    })
 
-	return err
+    if err == nil {
+        appendIgnoreIfMissing(user.Did)
+    }
+    return err
 }
 
 func isValidSession(ctx context.Context) bool {
@@ -190,6 +207,53 @@ func isValidSession(ctx context.Context) bool {
 	// 	fmt.Println("セション切れ", err)
 	// }
 	// return err == nil
+}
+
+// --- ignore.txt helpers ---
+func readIgnore() (map[string]bool, bool) {
+    b, err := os.ReadFile("ignore.txt")
+    if err != nil {
+        return nil, false
+    }
+    lines := strings.Split(string(b), "\n")
+    m := make(map[string]bool, len(lines))
+    for _, ln := range lines {
+        did := strings.TrimSpace(ln)
+        if did == "" {
+            continue
+        }
+        m[did] = true
+    }
+    return m, true
+}
+
+func writeIgnoreAll(set map[string]bool) {
+    list := make([]string, 0, len(set))
+    for did := range set {
+        list = append(list, did)
+    }
+    sort.Strings(list)
+    _ = os.WriteFile("ignore.txt", []byte(strings.Join(list, "\n")+"\n"), 0644)
+}
+
+func appendIgnoreIfMissing(did string) {
+    did = strings.TrimSpace(did)
+    if did == "" {
+        return
+    }
+    if ignoreCache == nil {
+        ignoreCache = make(map[string]bool)
+    }
+    if ignoreCache[did] {
+        return
+    }
+    f, err := os.OpenFile("ignore.txt", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+    if err != nil {
+        return
+    }
+    defer f.Close()
+    _, _ = f.WriteString(did + "\n")
+    ignoreCache[did] = true
 }
 
 func getDid(ctx context.Context) (string, error) {
